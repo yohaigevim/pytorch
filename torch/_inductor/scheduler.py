@@ -78,6 +78,7 @@ from .utils import (
     get_current_backend,
     get_device_tflops,
     get_dtype_size,
+    get_fused_kernel_name,
     get_gpu_dram_gbps,
     get_op_names,
     GraphPartitionMap,
@@ -3170,6 +3171,11 @@ class Scheduler:
         # mutation_renames = {"buf1" : "buf0"}
         # in codegen we only use buf0, never buf1
         self.mutation_renames: dict[str, str] = {}
+
+        # Inverse of wrapper_code.reuses: maps original buffer name to the
+        # name that replaced it via inplace reuse.  Rebuilt before each
+        # node hook emission by _refresh_hook_reuse_map().
+        self._hook_reused_by: dict[str, str] = {}
 
         self.seen_template_fusions: OrderedSet[
             tuple[BaseSchedulerNode, BaseSchedulerNode]
@@ -6854,6 +6860,89 @@ class Scheduler:
         scheduler_node.codegen(V.graph.wrapper_code)
         self.free_buffers()
 
+    def _resolve_hook_name(self, name: str) -> str:
+        """Resolve buffer name through mutation renames and inplace reuse."""
+        name = self.mutation_real_name.get(name, name)
+        return self._hook_reused_by.get(name, name)
+
+    def _refresh_hook_reuse_map(self) -> None:
+        """Rebuild the inverse reuse map from wrapper codegen state."""
+        self._hook_reused_by: dict[str, str] = {
+            old: new for new, old in V.graph.wrapper_code.reuses.items()
+        }
+
+    def _get_hook_kernel_name(self, node: BaseSchedulerNode) -> str:
+        if node.is_extern() and isinstance(node.node, ir.ExternKernel):
+            return node.node.python_kernel_name or node.get_name()
+        if isinstance(node, NopKernelSchedulerNode):
+            return node.get_name()
+        descriptive_names = (
+            config.cpp.descriptive_names
+            if node.is_cpu()
+            else config.triton.descriptive_names
+        )
+        if descriptive_names:
+            return get_fused_kernel_name(node.get_nodes(), descriptive_names)
+        return node.get_name()
+
+    def _collect_extern_input_exprs(self, node: BaseSchedulerNode) -> list[str]:
+        """Collect val_to_arg_str expressions for extern kernel inputs."""
+        assert isinstance(node.node, ir.ExternKernel)
+        exprs: list[str] = []
+        for x in node.node.inputs:
+            items = x if isinstance(x, (list, tuple)) else [x]
+            for item in items:
+                if not isinstance(item, ir.IRNode):
+                    continue
+                resolved = self._resolve_hook_name(item.get_name())
+                if resolved not in V.graph.removed_buffers:
+                    exprs.append(V.graph.wrapper_code.val_to_arg_str(item))
+        return exprs
+
+    def _collect_simd_input_names(self, node: BaseSchedulerNode) -> list[str]:
+        """Collect resolved buffer names for SIMD kernel read dependencies."""
+        names: list[str] = []
+        for dep in node.read_writes.reads:
+            resolved = self._resolve_hook_name(dep.name)
+            if resolved in V.graph.removed_buffers:
+                continue
+            if resolved in V.graph.graph_inputs or resolved in V.graph.name_to_buffer:
+                if resolved not in names:
+                    names.append(resolved)
+        return names
+
+    def _emit_node_hook(
+        self,
+        hook_fn: str,
+        node: BaseSchedulerNode,
+        names: list[str],
+    ) -> None:
+        """Emit a hook call with the given function name and argument list."""
+        if not names:
+            return
+        kn = self._get_hook_kernel_name(node)
+        args_str = ", ".join(names)
+        V.graph.wrapper_code.writeline(f"{hook_fn}({kn!r}, [{args_str}])")
+
+    def _emit_pre_node_hook(self, node: BaseSchedulerNode) -> None:
+        """Emit run_pre_node_hook() with inputs before node execution."""
+        if node.is_extern() and isinstance(node.node, ir.ExternKernel):
+            input_exprs = self._collect_extern_input_exprs(node)
+        else:
+            input_exprs = self._collect_simd_input_names(node)
+        self._emit_node_hook("run_pre_node_hook", node, input_exprs)
+
+    def _emit_post_node_hook(self, node: BaseSchedulerNode) -> None:
+        """Emit run_post_node_hook() with outputs after node execution."""
+        output_names: list[str] = []
+        for n in node.get_buffer_names():
+            resolved = self._resolve_hook_name(n)
+            if resolved in V.graph.removed_buffers:
+                continue
+            if resolved not in output_names:
+                output_names.append(resolved)
+        self._emit_node_hook("run_post_node_hook", node, output_names)
+
     def create_backend(self, device: torch.device) -> BaseScheduling:
         assert not is_gpu(device.type) or device.index is not None, (
             f"{device} should have been normalized in lowering"
@@ -7836,6 +7925,19 @@ class Scheduler:
             self.current_node = node
             self.buffer_names_to_free.update(node.last_usage)
 
+            _emit_hooks = (
+                config.generate_node_hooks
+                and not isinstance(node, NopKernelSchedulerNode)
+                and V.graph.wrapper_code.supports_intermediate_hooks
+            )
+            if _emit_hooks:
+                self._refresh_hook_reuse_map()
+                self._emit_pre_node_hook(self.current_node)
+                # Defer buffer freeing so the post-hook can still
+                # reference output buffers before they are deleted.
+                _saved_to_free = self.buffer_names_to_free.copy()
+                self.buffer_names_to_free.clear()
+
             if node.is_template():
                 prologue, template_node, epilogue = node.get_prologue_template_epilogue(
                     list(node.get_nodes())
@@ -7871,6 +7973,18 @@ class Scheduler:
             else:
                 assert isinstance(node, NopKernelSchedulerNode)
                 node.mark_run()
+
+            if _emit_hooks:
+                # Flush any buffered kernel code so the kernel call
+                # appears before the post-hook in the generated output.
+                for backend in self.backends.values():
+                    backend.flush()
+                self._emit_post_node_hook(self.current_node)
+                # Restore deferred buffers and free them now.
+                self.buffer_names_to_free.update(
+                    _saved_to_free  # pyrefly: ignore [unbound-name]
+                )
+                self.free_buffers()
 
             # pyrefly: ignore [unbound-name]
             if config.triton.debug_sync_kernel:

@@ -1409,6 +1409,12 @@ profiler_mark_wrapper_call = False
 # from the original FX graph
 generate_intermediate_hooks = False
 
+# Generate hook calls to torch._inductor.hooks.run_pre_node_hook and
+# run_post_node_hook around each node execution (triton, extern, fallback)
+# with the kernel name and input/output tensors, enabling runtime inspection
+# at kernel boundaries.
+generate_node_hooks = False
+
 # Populate traceback field on IRNode; good for debugging why origin_node is
 # not populated, or finding out where an IRNode was constructed
 debug_ir_traceback = False

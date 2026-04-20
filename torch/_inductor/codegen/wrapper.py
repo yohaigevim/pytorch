@@ -1372,6 +1372,7 @@ class PythonWrapperCodegen(CodeGen):
                 from math import inf, nan
                 from cmath import nanj
                 from torch._inductor.hooks import run_intermediate_hooks
+                from torch._inductor.hooks import run_pre_node_hook, run_post_node_hook
                 from torch._inductor.utils import maybe_profile
                 from torch._inductor.codegen.memory_planning import _align as align
                 from torch import device, empty_strided
